@@ -1,0 +1,280 @@
+import os, sys, io, json, base64, traceback
+from datetime import datetime
+from pathlib import Path
+
+# ──                Project root  ──────────────────────────────────────────────────
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
+
+from flask import Flask, request, jsonify, send_from_directory
+from flask_cors import CORS # communicat with  f and b
+from werkzeug.utils import secure_filename 
+import numpy as np
+from PIL import Image # resize image 
+
+from database.db import (
+    init_db, save_prediction, list_predictions, get_prediction,
+    create_patient, list_patients, get_patient, get_stats,
+    save_model_run, list_model_runs,
+) # connect to sqlightt
+
+# ───Config image uplode info ───────────────────────────────────────────────────────────────────
+UPLOAD_DIR    = os.path.join(ROOT, "uploads")
+MODEL_PATH    = os.path.join(ROOT, "models", "pneumonia_model.h5")
+HIST_PATH     = os.path.join(ROOT, "models", "training_history.json")
+IMG_SIZE      = (224, 224)
+ALLOWED_EXT   = {"jpg", "jpeg", "png", "bmp", "tiff", "webp"}
+MAX_CONTENT   = 16 * 1024 * 1024   # 16 MB
+
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT
+CORS(app, resources={r"/api/*": {"origins": "*"}})
+
+# ─── loader train ai model improve speed  ────────────────────────────────────────────────────────
+_model = None
+
+def load_model():
+    global _model
+    if _model is not None:
+        return _model
+    if not os.path.exists(MODEL_PATH):
+        return None
+    try:
+        import tensorflow as tf
+        _model = tf.keras.models.load_model(MODEL_PATH)
+        print(f"[✓] Model loaded from {MODEL_PATH}")
+    except Exception as e:
+        print(f"[✗] Model load failed: {e}")
+        _model = None
+    return _model
+
+
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+
+def allowed_file(filename: str) -> bool:
+    return "." in filename and \
+           filename.rsplit(".", 1)[1].lower() in ALLOWED_EXT
+
+
+def preprocess(img: Image.Image) -> np.ndarray:
+    img = img.convert("RGB").resize(IMG_SIZE)
+    arr = np.array(img, dtype=np.float32) / 255.0
+    return np.expand_dims(arr, 0)
+
+
+def predict_image(img: Image.Image):
+    model = load_model()
+    if model is None:
+        # Demo mode: return random plausible result
+        import random
+        score = random.uniform(0.1, 0.9)
+        label = "PNEUMONIA" if score > 0.5 else "NORMAL"
+        conf  = score if score > 0.5 else (1 - score)
+        return label, round(conf, 4), round(float(score), 4), True
+    arr   = preprocess(img)
+    score = float(model.predict(arr, verbose=0)[0][0])
+    label = "PNEUMONIA" if score > 0.5 else "NORMAL"
+    conf  = score if score > 0.5 else (1 - score)
+    return label, round(conf, 4), round(score, 4), False
+
+
+def img_to_b64(img: Image.Image, fmt="JPEG") -> str:
+    buf = io.BytesIO()
+    img.save(buf, format=fmt)
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+# ─── Routes anlysed the backend is working or not  ───────────────────────────────────────────────────────────────────
+
+@app.route("/api/health")
+def health():
+    model_loaded = os.path.exists(MODEL_PATH)
+    return jsonify({
+        "status":       "ok",
+        "model_loaded": model_loaded,
+        "timestamp":    datetime.utcnow().isoformat(),
+    })
+
+
+@app.route("/api/predict", methods=["POST"])
+def predict():
+    """Accept image (multipart or JSON base64), return prediction."""
+    try:
+        patient_id = request.form.get("patient_id") or \
+                     (request.json or {}).get("patient_id")
+        notes      = request.form.get("notes") or \
+                     (request.json or {}).get("notes")
+
+        # ── Get image and process it  ─────────────────────────────────────────────────────────
+        if "file" in request.files:
+            f = request.files["file"]
+            if not allowed_file(f.filename):
+                return jsonify({"error": "File type not allowed"}), 400
+            filename = secure_filename(f.filename)
+            save_path = os.path.join(UPLOAD_DIR, filename)
+            f.save(save_path)
+            img = Image.open(save_path)
+
+        elif request.is_json and "image_base64" in request.json:
+            b64 = request.json["image_base64"]
+            if "," in b64:
+                b64 = b64.split(",", 1)[1]
+            img_bytes = base64.b64decode(b64)
+            img       = Image.open(io.BytesIO(img_bytes))
+            filename  = request.json.get("filename", "upload.jpg")
+            save_path = os.path.join(UPLOAD_DIR, secure_filename(filename))
+            img.save(save_path)
+        else:
+            return jsonify({"error": "No image provided"}), 400
+
+        # ── Predict it demo imag prdiction  ───────────────────────────────────────────────────────────
+        label, confidence, raw_score, demo_mode = predict_image(img)
+
+        # ── Persist ───────────────────────────────────────────────────────────
+        record = save_prediction(
+            image_filename=filename,
+            label=label,
+            confidence=confidence,
+            raw_score=raw_score,
+            patient_id=patient_id,
+            image_path=save_path,
+            notes=notes,
+        )
+
+        # ── Thumbnail ─────────────────────────────────────────────────────────
+        thumb = img.copy()
+        thumb.thumbnail((256, 256))
+        thumb_b64 = img_to_b64(thumb)
+
+        return jsonify({
+            "id":           record["id"],
+            "label":        label,
+            "confidence":   confidence,
+            "raw_score":    raw_score,
+            "is_pneumonia": label == "PNEUMONIA",
+            "demo_mode":    demo_mode,
+            "filename":     filename,
+            "thumbnail":    f"data:image/jpeg;base64,{thumb_b64}",
+            "created_at":   record["created_at"],
+        })
+
+    except Exception:
+        traceback.print_exc()
+        return jsonify({"error": "Internal server error"}), 500
+
+
+@app.route("/api/predictions", methods=["GET"])
+def get_predictions():
+    limit = int(request.args.get("limit", 50))
+    return jsonify(list_predictions(limit))
+
+
+@app.route("/api/predictions/<pred_id>", methods=["GET"])
+def get_single_prediction(pred_id):
+    pred = get_prediction(pred_id)
+    if not pred:
+        return jsonify({"error": "Not found"}), 404
+    # Attach thumbnail if file exists
+    if pred.get("image_path") and os.path.exists(pred["image_path"]):
+        try:
+            img   = Image.open(pred["image_path"])
+            thumb = img.copy()
+            thumb.thumbnail((256, 256))
+            pred["thumbnail"] = f"data:image/jpeg;base64,{img_to_b64(thumb)}"
+        except Exception:
+            pass
+    return jsonify(pred)
+
+
+@app.route("/api/patients", methods=["POST"])
+def new_patient():
+    data = request.json or {}
+    if not data.get("name"):
+        return jsonify({"error": "name is required"}), 400
+    p = create_patient(data["name"], data.get("age"), data.get("gender"))
+    return jsonify(p), 201
+
+
+@app.route("/api/patients", methods=["GET"])
+def get_patients():
+    return jsonify(list_patients())
+
+
+@app.route("/api/patients/<patient_id>", methods=["GET"])
+def get_single_patient(patient_id):
+    p = get_patient(patient_id)
+    if not p:
+        return jsonify({"error": "Not found"}), 404
+    return jsonify(p)
+
+
+@app.route("/api/stats", methods=["GET"])
+def stats():
+    s = get_stats()
+    runs = list_model_runs()
+    latest = runs[0] if runs else None
+    s["model_trained"] = os.path.exists(MODEL_PATH)
+    if latest and latest.get("history"):
+        h = latest["history"].get("history", {})
+        s["last_train_accuracy"] = h.get("accuracy", [None])[-1]
+        s["last_val_accuracy"]   = h.get("val_accuracy", [None])[-1]
+        s["last_f1"]             = latest["history"].get("test_metrics", {}).get("f1_score")
+    return jsonify(s)
+
+
+@app.route("/api/model/history", methods=["GET"])
+def model_history():
+    if os.path.exists(HIST_PATH):
+        with open(HIST_PATH) as f:
+            return jsonify(json.load(f))
+    runs = list_model_runs()
+    if runs:
+        return jsonify(runs[0].get("history", {}))
+    return jsonify({"error": "No training history found"}), 404
+
+
+@app.route("/api/model/train", methods=["POST"])
+def trigger_training():
+    """Start training in a background thread."""
+    import threading
+
+    def _train():
+        try:
+            # Ensure dataset exists
+            from dataset.create_dataset import (
+                make_dirs, generate_synthetic_dataset,
+                get_dataset_stats, save_stats, DATASET_DIR,
+            )
+            train_dir = os.path.join(DATASET_DIR, "train", "NORMAL")
+            if not os.path.isdir(train_dir) or not os.listdir(train_dir):
+                make_dirs()
+                generate_synthetic_dataset()
+                save_stats(get_dataset_stats())
+
+            from models.train_model import train
+            _, record = train()
+            save_model_run(record)
+            global _model
+            _model = None  # force reload
+            print("[✓] Training complete.")
+        except Exception:
+            traceback.print_exc()
+
+    t = threading.Thread(target=_train, daemon=True)
+    t.start()
+    return jsonify({"message": "Training started in background"}), 202
+
+
+@app.route("/api/uploads/<filename>")
+def serve_upload(filename):
+    return send_from_directory(UPLOAD_DIR, filename)
+
+
+# ─── Entry ────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    init_db()
+    load_model()
+    print("\n[✓] Pneumonia Detection API running on http://localhost:5000\n")
+    app.run(debug=True, port=5000, host="0.0.0.0")
