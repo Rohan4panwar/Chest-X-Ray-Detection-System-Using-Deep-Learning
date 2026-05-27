@@ -1,0 +1,238 @@
+"""
+Model Training Script — Pneumonia Detection CNN
+================================================
+Architecture : MobileNetV2 (transfer learning) fine-tuned on chest X-ray data
+Output       : models/pneumonia_model.h5  +  models/training_history.json
+"""
+
+import os, sys, json, time
+import numpy as np
+
+# ─── Paths ────────────────────────────────────────────────────────────────────
+ROOT       = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DATASET    = os.path.join(ROOT, "dataset", "chest_xray")
+MODEL_DIR  = os.path.join(ROOT, "models")
+MODEL_PATH = os.path.join(MODEL_DIR, "pneumonia_model.h5")
+HIST_PATH  = os.path.join(MODEL_DIR, "training_history.json")
+os.makedirs(MODEL_DIR, exist_ok=True)
+
+# ─── Hyper-parameters ─────────────────────────────────────────────────────────
+IMG_SIZE   = (224, 224)
+BATCH_SIZE = 32
+EPOCHS     = 15
+LR         = 1e-4
+SEED       = 42
+
+# ─── Imports (lazy so error messages are clear) ───────────────────────────────
+try:
+    import tensorflow as tf
+    from tensorflow.keras import layers, models, optimizers, callbacks
+    from tensorflow.keras.applications import MobileNetV2
+    from tensorflow.keras.preprocessing.image import ImageDataGenerator
+    print(f"[✓] TensorFlow {tf.__version__}")
+except ImportError:
+    sys.exit("[✗] TensorFlow not installed.  Run: pip install tensorflow")
+
+
+# ─── Data generators ──────────────────────────────────────────────────────────
+
+def build_generators():
+    train_aug = ImageDataGenerator(
+        rescale=1. / 255,
+        rotation_range=15,
+        width_shift_range=0.1,
+        height_shift_range=0.1,
+        shear_range=0.1,
+        zoom_range=0.1,
+        horizontal_flip=True,
+        fill_mode="nearest",
+    )
+    val_aug = ImageDataGenerator(rescale=1. / 255)
+
+    train_gen = train_aug.flow_from_directory(
+        os.path.join(DATASET, "train"),
+        target_size=IMG_SIZE, batch_size=BATCH_SIZE,
+        class_mode="binary", seed=SEED,
+        classes=["NORMAL", "PNEUMONIA"],
+    )
+    val_gen = val_aug.flow_from_directory(
+        os.path.join(DATASET, "val"),
+        target_size=IMG_SIZE, batch_size=BATCH_SIZE,
+        class_mode="binary", seed=SEED,
+        classes=["NORMAL", "PNEUMONIA"],
+    )
+    test_gen = val_aug.flow_from_directory(
+        os.path.join(DATASET, "test"),
+        target_size=IMG_SIZE, batch_size=BATCH_SIZE,
+        class_mode="binary", seed=SEED, shuffle=False,
+        classes=["NORMAL", "PNEUMONIA"],
+    )
+    return train_gen, val_gen, test_gen
+
+
+# ─── Model ────────────────────────────────────────────────────────────────────
+
+def build_model():
+    base = MobileNetV2(
+        input_shape=(*IMG_SIZE, 3),
+        include_top=False,
+        weights="imagenet",
+    )
+    # Freeze all base layers initially
+    base.trainable = False
+
+    model = models.Sequential([
+        base,
+        layers.GlobalAveragePooling2D(),
+        layers.BatchNormalization(),
+        layers.Dense(256, activation="relu"),
+        layers.Dropout(0.4),
+        layers.Dense(64, activation="relu"),
+        layers.Dropout(0.2),
+        layers.Dense(1, activation="sigmoid"),
+    ], name="PneumoniaDetector")
+
+    model.compile(
+        optimizer=optimizers.Adam(LR),
+        loss="binary_crossentropy",
+        metrics=["accuracy",
+                 tf.keras.metrics.AUC(name="auc"),
+                 tf.keras.metrics.Precision(name="precision"),
+                 tf.keras.metrics.Recall(name="recall")],
+    )
+    return model
+
+
+def unfreeze_top_layers(model, n=30):
+    """Fine-tune top N layers of the MobileNetV2 base."""
+    base = model.layers[0]
+    base.trainable = True
+    for layer in base.layers[:-n]:
+        layer.trainable = False
+    model.compile(
+        optimizer=optimizers.Adam(LR / 10),
+        loss="binary_crossentropy",
+        metrics=["accuracy",
+                 tf.keras.metrics.AUC(name="auc"),
+                 tf.keras.metrics.Precision(name="precision"),
+                 tf.keras.metrics.Recall(name="recall")],
+    )
+    print(f"[*] Fine-tuning top {n} base layers.")
+
+
+# ─── Callbacks ────────────────────────────────────────────────────────────────
+
+def build_callbacks():
+    return [
+        callbacks.ModelCheckpoint(
+            MODEL_PATH, monitor="val_accuracy",
+            save_best_only=True, verbose=1,
+        ),
+        callbacks.EarlyStopping(
+            monitor="val_loss", patience=5,
+            restore_best_weights=True, verbose=1,
+        ),
+        callbacks.ReduceLROnPlateau(
+            monitor="val_loss", factor=0.5,
+            patience=3, min_lr=1e-7, verbose=1,
+        ),
+    ]
+
+
+# ─── Evaluation ───────────────────────────────────────────────────────────────
+
+def evaluate(model, test_gen):
+    print("\n[*] Evaluating on test set...")
+    results = model.evaluate(test_gen, verbose=1)
+    names   = model.metrics_names
+    metrics = dict(zip(names, results))
+
+    # Confusion matrix
+    preds = (model.predict(test_gen, verbose=0) > 0.5).astype(int).flatten()
+    true  = test_gen.classes
+    tp = int(np.sum((preds == 1) & (true == 1)))
+    tn = int(np.sum((preds == 0) & (true == 0)))
+    fp = int(np.sum((preds == 1) & (true == 0)))
+    fn = int(np.sum((preds == 0) & (true == 1)))
+    metrics["confusion_matrix"] = {"tp": tp, "tn": tn, "fp": fp, "fn": fn}
+    metrics["f1_score"] = round(
+        2 * tp / (2 * tp + fp + fn + 1e-7), 4)
+
+    print("\n  Confusion Matrix:")
+    print(f"    TP={tp}  FP={fp}")
+    print(f"    FN={fn}  TN={tn}")
+    print(f"  F1 Score : {metrics['f1_score']:.4f}")
+    for k, v in metrics.items():
+        if k != "confusion_matrix":
+            print(f"  {k:12s}: {v:.4f}" if isinstance(v, float) else f"  {k}: {v}")
+    return metrics
+
+
+# ─── Train ────────────────────────────────────────────────────────────────────
+
+def train():
+    print("=" * 55)
+    print("  Pneumonia Detection — Model Training")
+    print("=" * 55)
+    t0 = time.time()
+
+    train_gen, val_gen, test_gen = build_generators()
+    model = build_model()
+    model.summary()
+
+    # Phase 1: train head only
+    print("\n[*] Phase 1 — Training classification head...")
+    history1 = model.fit(
+        train_gen, validation_data=val_gen,
+        epochs=EPOCHS // 2,
+        callbacks=build_callbacks(),
+    )
+
+    # Phase 2: fine-tune top base layers
+    unfreeze_top_layers(model)
+    print("\n[*] Phase 2 — Fine-tuning top base layers...")
+    history2 = model.fit(
+        train_gen, validation_data=val_gen,
+        epochs=EPOCHS,
+        initial_epoch=len(history1.history["loss"]),
+        callbacks=build_callbacks(),
+    )
+
+    # Merge histories
+    full_history = {}
+    for k in history1.history:
+        full_history[k] = history1.history[k] + history2.history.get(k, [])
+
+    test_metrics = evaluate(model, test_gen)
+
+    # Save history + metrics
+    record = {
+        "history": {k: [float(v) for v in vals]
+                    for k, vals in full_history.items()},
+        "test_metrics": {k: (float(v) if isinstance(v, (float, np.floating)) else v)
+                         for k, v in test_metrics.items()},
+        "epochs_trained": len(full_history["loss"]),
+        "training_time_sec": round(time.time() - t0, 1),
+        "model_path": MODEL_PATH,
+        "img_size": IMG_SIZE,
+        "class_indices": {"NORMAL": 0, "PNEUMONIA": 1},
+    }
+    with open(HIST_PATH, "w") as f:
+        json.dump(record, f, indent=2)
+
+    print(f"\n[✓] Model saved  → {MODEL_PATH}")
+    print(f"[✓] History saved → {HIST_PATH}")
+    print(f"[✓] Training complete in {record['training_time_sec']}s")
+    return model, record
+
+
+if __name__ == "__main__":
+    # Ensure dataset exists
+    train_dir = os.path.join(DATASET, "train", "NORMAL")
+    if not os.path.isdir(train_dir) or not os.listdir(train_dir):
+        print("[!] Dataset missing — running create_dataset.py first...")
+        import subprocess
+        subprocess.run([sys.executable,
+                        os.path.join(ROOT, "dataset", "create_dataset.py")])
+    train()
+     
